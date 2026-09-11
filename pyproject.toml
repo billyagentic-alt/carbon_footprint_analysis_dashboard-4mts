@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "carbon_footprint_analysis_dashboard-4mts"
+version = "0.1.0"
+description = "Dashboard Streamlit interactif pour analyser l'empreinte carbone des pays et les émissions par secteur (OWID / World Bank) avec filtres temporels et sectoriels, KPIs calculés, visualisations Plotly et architecture data layer séparée."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "streamlit",
+    "plotly",
+    "pandas",
+    "numpy",
+    "requests",
+    "python-dotenv",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-cov",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
