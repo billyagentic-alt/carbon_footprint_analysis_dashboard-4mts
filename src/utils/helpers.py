@@ -1,9 +1,15 @@
 import logging
 import sys
+import time
+import random
 from pathlib import Path
 from typing import Any, Callable, Iterable, Literal, Mapping, Optional, Union
 
 import pandas as pd
+import requests
+import streamlit as st
+
+from src.config import CONFIG
 
 __all__ = [
     "get_logger",
@@ -12,6 +18,9 @@ __all__ = [
     "safe_merge",
     "add_year_column",
     "to_numeric",
+    "DataFetchError",
+    "http_get",
+    "cache_dataframe",
 ]
 
 
@@ -257,74 +266,105 @@ def add_year_column(
     ------
     KeyError
         If ``date_column`` does not exist.
+    ValueError
+        If the column cannot be parsed as dates.
     """
     logger = get_logger(__name__)
 
     if date_column not in df.columns:
         logger.error("Date column %s not found in DataFrame", date_column)
-        raise KeyError(f"Column {date_column!r} not found in DataFrame")
+        raise KeyError(f"Date column '{date_column}' not found in DataFrame")
 
     df_copy = df.copy()
+
     try:
         if date_format:
             df_copy[date_column] = pd.to_datetime(df_copy[date_column], format=date_format, errors="raise")
         else:
-            df_copy[date_column] = pd.to_datetime(df_copy[date_column], errors="coerce")
+            df_copy[date_column] = pd.to_datetime(df_copy[date_column], errors="raise")
     except Exception as exc:
-        logger.exception("Failed to parse dates in column %s", date_column)
-        raise ValueError(f"Unable to parse dates in column {date_column!r}") from exc
-
-    if df_copy[date_column].isna().any():
-        logger.warning("Some dates could not be parsed and will result in NaN years")
+        logger.error("Failed to parse dates in column %s: %s", date_column, exc)
+        raise ValueError(f"Unable to parse dates in column '{date_column}'") from exc
 
     df_copy[new_column_name] = df_copy[date_column].dt.year
-    logger.debug("Added year column %s based on %s", new_column_name, date_column)
+    logger.debug(
+        "Added year column '%s' based on '%s'; resulting DataFrame has %d rows",
+        new_column_name,
+        date_column,
+        df_copy.shape[0],
+    )
     return df_copy
 
 
 def to_numeric(
-    series: pd.Series,
-    *,
-    errors: Literal["raise", "coerce", "ignore"] = "coerce",
-    downcast: Optional[Literal["integer", "signed", "unsigned", "float"]] = None,
-) -> pd.Series:
+    df: pd.DataFrame,
+    columns: Optional[Iterable[str]] = None,
+    errors: Literal["raise", "ignore", "coerce"] = "coerce",
+) -> pd.DataFrame:
     """
-    Convert a pandas Series to a numeric dtype with consistent error handling.
-
-    This wrapper centralises the conversion logic used throughout the project,
-    ensuring that non‑numeric values are handled uniformly.
+    Convert one or several columns of a DataFrame to numeric dtype.
 
     Parameters
     ----------
-    series:
-        Input pandas Series.
+    df:
+        Input DataFrame.
+    columns:
+        Iterable of column names to convert. If ``None``, all object‑type columns
+        are considered.
     errors:
-        How to handle parsing errors – ``"raise"``, ``"coerce"``, or ``"ignore"``.
-    downcast:
-        Optional downcast argument passed to :func:`pandas.to_numeric`.
+        How to handle conversion errors – ``'raise'``, ``'ignore'`` or
+        ``'coerce'`` (default). ``'coerce'`` turns invalid parsing into ``NaN``.
 
     Returns
     -------
-    pd.Series
-        Numeric Series (float64 by default, possibly downcast).
-
-    Raises
-    ------
-    ValueError
-        If ``errors`` is ``"raise"`` and conversion fails.
+    pd.DataFrame
+        A copy of ``df`` with the selected columns converted to numeric.
     """
     logger = get_logger(__name__)
 
-    try:
-        numeric = pd.to_numeric(series, errors=errors, downcast=downcast)
-    except Exception as exc:
-        logger.exception("Failed to convert series to numeric")
-        raise ValueError("Series could not be converted to numeric") from exc
+    df_copy = df.copy()
+    target_cols = list(columns) if columns is not None else df_copy.select_dtypes(include="object").columns.tolist()
 
-    if errors == "coerce" and numeric.isna().any():
-        logger.info(
-            "Series conversion introduced %d NaN values out of %d entries",
-            numeric.isna().sum(),
-            len(series),
-        )
-    return numeric
+    for col in target_cols:
+        if col not in df_copy.columns:
+            logger.warning("Column %s not found in DataFrame; skipping numeric conversion", col)
+            continue
+        try:
+            df_copy[col] = pd.to_numeric(df_copy[col], errors=errors)
+            logger.debug("Converted column %s to numeric", col)
+        except Exception as exc:
+            logger.error("Failed to convert column %s to numeric: %s", col, exc)
+            raise
+
+    return df_copy
+
+
+class DataFetchError(Exception):
+    """
+    Custom exception raised when an HTTP request fails after the configured
+    number of retries.
+    """
+    pass
+
+
+def http_get(url: str, timeout: int = 10, retries: int = 3) -> requests.Response:
+    """
+    Perform an HTTP GET request with exponential back‑off retries.
+
+    Parameters
+    ----------
+    url:
+        The URL to request.
+    timeout:
+        Number of seconds to wait for a response from the server.
+    retries:
+        Number of additional attempts after the first failure. The wait time
+        between attempts grows exponentially (1, 2, 4, … seconds) with a small
+        random jitter.
+
+    Returns
+    -------
+    requests.Response
+        The successful response object.
+
+   
